@@ -1,1 +1,0 @@
-from algo.buchi.scc import path_finding
