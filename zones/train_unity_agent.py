@@ -1,4 +1,5 @@
 import torch
+import os
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -18,44 +19,68 @@ def create_env_with_id(unity_env_path, worker_id):
     return _init
 
 def train_goal_conditioned_agent(unity_env_path, total_timesteps, num_envs, device):
-    # Create list of env functions with unique worker IDs
-    env_fns = [create_env_with_id(unity_env_path, i) for i in range(num_envs)]
+    print(f"Starting training for {total_timesteps} timesteps...")
     
-    # Create vectorized environment with seed handling disabled
+    env_fns = [create_env_with_id(unity_env_path, i) for i in range(num_envs)]
     env = SubprocVecEnv(env_fns, start_method='spawn')
     
-    # Initialize PPO model with appropriate parameters
+    # Get the correct observation dimension from the environment
+    obs_dim = env.observation_space['obs'].shape[0]
+    print(f"Observation dimension: {obs_dim}")
+    
+    # Setup logging
+    log_dir = "logs/training_progress"
+    os.makedirs(log_dir, exist_ok=True)
+    
     model = PPO(
         "MultiInputPolicy",
         env,
         verbose=1,
-        device=device,
-        n_steps=512,  # Adjust based on your needs
-        batch_size=64,
-        n_epochs=10,
-        learning_rate=3e-4,
-        ent_coef=0.01,
+        tensorboard_log=log_dir,
+        device=device
     )
     
-    # Initialize trajectory buffer
+    # Initialize trajectory buffer with correct observation dimension
     traj_buffer = TrajectoryBuffer(
         traj_length=1000,
         buffer_size=total_timesteps,
-        obs_dim=100,  # Adjust based on your observation space
+        obs_dim=obs_dim,  # Use the actual observation dimension
         n_envs=num_envs,
         device=device
     )
     
-    # Setup callback
-    callback = CollectTrajectoryCallback(traj_buffer=traj_buffer)
-    
-    # Train model
-    model.learn(
-        total_timesteps=total_timesteps,
-        callback=callback
-    )
-    
-    # Build dataset from collected trajectories
-    trajectory_dataset = traj_buffer.build_dataset(model.policy)
-    
-    return model, trajectory_dataset
+    try:
+        print("Training model...")
+        model.learn(
+            total_timesteps=total_timesteps,
+            callback=CollectTrajectoryCallback(traj_buffer),
+            progress_bar=True
+        )
+        
+        print("Building trajectory dataset...")
+        trajectory_dataset = traj_buffer.build_dataset(model.policy)
+        
+        # Save model and dataset
+        os.makedirs("models", exist_ok=True)
+        os.makedirs("datasets", exist_ok=True)
+        
+        model_path = os.path.join("models", "trained_model")
+        dataset_path = os.path.join("datasets", "trajectory_dataset.pt")
+        
+        print(f"Saving model to {model_path}")
+        model.save(model_path)
+        
+        print(f"Saving trajectory dataset to {dataset_path}")
+        torch.save(trajectory_dataset, dataset_path)
+        
+        print("Training completed successfully!")
+        print(f"Total episodes completed: {model.num_timesteps}")
+        print(f"Total trajectories collected: {len(trajectory_dataset)}")
+        
+        return model, trajectory_dataset
+        
+    except Exception as e:
+        print(f"Error during training: {e}")
+        raise
+    finally:
+        env.close()

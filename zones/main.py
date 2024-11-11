@@ -10,13 +10,17 @@ from envs.unity import UnityGCRLLTLWrapper
 def main(args):
     # Step 1: Train goal-conditioned agent and collect trajectory data
     if args.train_agent:
+        print("\n=== Starting Training ===")
         model, trajectory_dataset = train_goal_conditioned_agent(
             unity_env_path=args.unity_env_path,
             total_timesteps=args.total_timesteps,
             num_envs=args.num_envs,
             device=args.device
         )
-    
+        
+        print("\n=== Training Complete ===")
+        print("Model saved to: models/trained_model")
+        print("Dataset saved to: datasets/trajectory_dataset.pt")
     # Step 2: Train Goal-Conditioned Value Function
     if args.train_gcvf:
         gcvf = train_value_function(

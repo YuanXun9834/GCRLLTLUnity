@@ -41,6 +41,7 @@ class TrajectoryBuffer:
         self.n_envs = n_envs
         self.device = device
         self.zone_vector = get_zone_vector()
+        print(f"Initializing TrajectoryBuffer with obs_dim={obs_dim}")
         self.reset()
     
     def reset(self) -> None:
@@ -55,17 +56,25 @@ class TrajectoryBuffer:
         self.pos = 0
 
     def add_rollouts(self, rollout_buffer: RolloutBuffer) -> None:
-        rollout_obs = rollout_buffer.observations['obs'].transpose(1, 0, 2)  # (n_envs, n_steps/n_envs, obs_dim)
-        rollout_success = rollout_buffer.observations['success'].transpose(1, 0, 2)
-        rollout_steps = rollout_buffer.observations['steps'].transpose(1, 0, 2)
-
+        rollout_obs = rollout_buffer.observations['obs'].transpose(1, 0, 2)
+        
+        # Print shapes for debugging
+        print(f"Rollout obs shape: {rollout_obs.shape}")
+        print(f"Buffer obs shape: {self.buffers[0]['obs'].shape}")
+        
         shape = rollout_obs.shape
         forward_steps = shape[1]
 
         for pid in range(self.n_envs):
-            self.buffers[pid]['obs'][self.pos: self.pos + forward_steps] = rollout_obs[pid]
-            self.buffers[pid]['success'][self.pos: self.pos + forward_steps] = rollout_success[pid]
-            self.buffers[pid]['steps'][self.pos: self.pos + forward_steps] = rollout_steps[pid]
+            try:
+                self.buffers[pid]['obs'][self.pos: self.pos + forward_steps] = rollout_obs[pid]
+                self.buffers[pid]['success'][self.pos: self.pos + forward_steps] = rollout_buffer.observations['success'].transpose(1, 0, 2)[pid]
+                self.buffers[pid]['steps'][self.pos: self.pos + forward_steps] = rollout_buffer.observations['steps'].transpose(1, 0, 2)[pid]
+            except ValueError as e:
+                print(f"Error adding rollouts: {e}")
+                print(f"Buffer shape: {self.buffers[pid]['obs'][self.pos: self.pos + forward_steps].shape}")
+                print(f"Rollout shape: {rollout_obs[pid].shape}")
+                raise
 
         self.pos += forward_steps
 
