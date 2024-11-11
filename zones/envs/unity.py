@@ -18,7 +18,8 @@ class UnityGCRLLTLWrapper(gym.Env):
         worker_id: int = 0,
         no_graphics: bool = True,
         time_scale: float = 20.0,
-        seed: int = 0
+        seed: int = 0,
+        max_steps: int = 100
     ):
         super().__init__()
         
@@ -74,6 +75,7 @@ class UnityGCRLLTLWrapper(gym.Env):
             self.steps = 0
             self.goal_achieved = False
             self.last_obs = None
+            self.max_steps = max_steps
             
             print(f"Unity environment {self.worker_id} initialized successfully")
             
@@ -153,21 +155,52 @@ class UnityGCRLLTLWrapper(gym.Env):
 
     def _process_obs(self, steps):
         """Process Unity observation steps into numpy array"""
-        obs = []
-        for o in steps.obs:
-            if len(o.shape) == 1:  # Only use vector observations
-                obs.append(o[0])
-        return np.concatenate(obs)
+        obs_list = []
+        
+        # Check if we have any observations
+        if len(steps.obs) == 0:
+            print("Warning: No observations received from Unity environment")
+            return np.zeros(38)  # Return zero array with correct dimension
+            
+        for obs_idx, obs in enumerate(steps.obs):
+            if len(obs.shape) == 1:  # Vector observations
+                obs_list.append(obs[0])
+            elif len(obs.shape) == 3:  # Visual observations (3, 64, 84)
+                # Flatten or process visual observation if needed
+                flat_visual = obs[0].reshape(-1)  # Flatten the first instance
+                obs_list.append(flat_visual)
+                
+        if not obs_list:
+            print("Warning: No valid observations to process")
+            return np.zeros(38)  # Return zero array with correct dimension
+            
+        try:
+            # Print shapes for debugging
+            print("Observation shapes before concatenation:", [arr.shape for arr in obs_list])
+            concatenated = np.concatenate(obs_list)
+            print("Concatenated observation shape:", concatenated.shape)
+            return concatenated
+        except Exception as e:
+            print(f"Error concatenating observations: {e}")
+            print("Observation list:", obs_list)
+            return np.zeros(38)
 
     def _get_obs(self, obs):
         """Convert Unity observation to GCRLLTL format"""
         if self.current_goal is None:
-            goal_vec = np.zeros(24)  # 8 sets of 3D vectors
+            goal_vec = np.zeros(24)
         else:
             goal_vec = self.goals_representation[self.current_goal]
             
+        # Make sure obs is the right shape
+        if isinstance(obs, np.ndarray):
+            processed_obs = obs
+        else:
+            print(f"Warning: Invalid observation type: {type(obs)}")
+            processed_obs = np.zeros(38)
+        
         return {
-            'obs': np.concatenate([obs, goal_vec]).astype(np.float32),
+            'obs': np.concatenate([processed_obs, goal_vec]).astype(np.float32),
             'success': np.array([float(self.goal_achieved)], dtype=np.float32),
             'steps': np.array([self.steps], dtype=np.float32)
         }
@@ -182,7 +215,7 @@ class UnityGCRLLTLWrapper(gym.Env):
         """Execute step in environment"""
         if self.unity_env is None:
             raise RuntimeError("Unity environment is not initialized")
-            
+                
         try:
             # Convert action to Unity format
             if isinstance(self.action_space, spaces.Box):
@@ -198,10 +231,11 @@ class UnityGCRLLTLWrapper(gym.Env):
             decision_steps, terminal_steps = self.unity_env.get_steps(self.behavior_name)
             
             # Check if episode ended
-            done = len(terminal_steps) > 0
+            terminated = len(terminal_steps) > 0
+            truncated = False  # Set to True if episode is truncated due to time limit
             
             # Get observation and reward
-            if done:
+            if terminated:
                 obs = self._process_obs(terminal_steps)
                 reward = terminal_steps.reward[0]
             else:
@@ -219,30 +253,44 @@ class UnityGCRLLTLWrapper(gym.Env):
                 'steps': self.steps
             }
             
-            return self._get_obs(obs), reward, done, info
+            truncated = self.steps >= self.max_steps
+            if truncated:
+                terminated = True
             
+            return self._get_obs(obs), reward, terminated, truncated, info
+                
         except Exception as e:
             print(f"Error during step: {str(e)}")
             raise
 
-    def reset(self):
-        """Reset environment"""
+    def reset(self, seed=None, options=None):
+        """Reset environment with optional seed and options"""
         if self.unity_env is None:
             raise RuntimeError("Unity environment is not initialized")
-            
+                
         try:
+            # Set seed if provided (Unity handles seeding internally)
+            if seed is not None:
+                self.unity_env.seed = seed
+                
             self.unity_env.reset()
             decision_steps, _ = self.unity_env.get_steps(self.behavior_name)
-            
+                
             self.steps = 0
             self.goal_achieved = False
             
+            # Print debug info
+            print(f"Reset - Decision steps shape: {decision_steps.obs[0].shape}")
+                
             # Get initial observation
             obs = self._process_obs(decision_steps)
             self.last_obs = obs
-            
-            return self._get_obs(obs)
-            
+                
+            formatted_obs = self._get_obs(obs)
+            print(f"Reset - Formatted observation shapes: {[(k, v.shape) for k, v in formatted_obs.items()]}")
+                
+            return formatted_obs, {}
+                
         except Exception as e:
             print(f"Error during reset: {str(e)}")
             raise
