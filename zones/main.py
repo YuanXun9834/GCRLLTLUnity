@@ -1,4 +1,5 @@
 import argparse
+import logging
 import torch
 from train_unity_agent import train_goal_conditioned_agent
 from train_gcvf import main as train_value_function
@@ -10,6 +11,8 @@ from envs.unity import UnityGCRLLTLWrapper
 def main(args):
     # Step 1: Train goal-conditioned agent and collect trajectory data
     if args.train_agent:
+        if args.unity_env_path is None:
+            raise ValueError("--unity_env_path is required for training the agent")
         print("\n=== Starting Training ===")
         model, trajectory_dataset = train_goal_conditioned_agent(
             unity_env_path=args.unity_env_path,
@@ -23,6 +26,8 @@ def main(args):
         print("Dataset saved to: datasets/trajectory_dataset.pt")
     # Step 2: Train Goal-Conditioned Value Function
     if args.train_gcvf:
+        if args.dataset_path is None:
+            raise ValueError("--dataset_path is required for training GCVF")
         gcvf = train_value_function(
             dataset_path=args.dataset_path,
             device=args.device
@@ -30,6 +35,8 @@ def main(args):
 
     # Step 3: Execute LTL task
     if args.execute_ltl:
+        if any(arg is None for arg in [args.unity_env_path, args.model_path, args.gcvf_path, args.ltl_formula]):
+            raise ValueError("--unity_env_path, --model_path, --gcvf_path, and --ltl_formula are required for LTL execution")
         # Convert LTL formula using ltl2ba
         ltl_args = get_ltl_formula(formula=args.ltl_formula)
         buchi_graph = gltl2ba(ltl_args)
@@ -77,19 +84,34 @@ def get_value_map(model, gcvf, ob, zone_vector, device):
     return value_map
 
 if __name__ == "__main__":
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('training.log'),
+            logging.StreamHandler()
+        ]
+    )
     parser = argparse.ArgumentParser()
-    parser.add_argument("--unity_env_path", type=str, required=True)
+    parser.add_argument("--unity_env_path", type=str,
+                      help="Path to Unity environment executable")
     parser.add_argument("--train_agent", action="store_true")
-    parser.add_argument("--train_gcvf", action="store_true") 
+    parser.add_argument("--train_gcvf", action="store_true")
     parser.add_argument("--execute_ltl", action="store_true")
     parser.add_argument("--ltl_formula", type=str)
     parser.add_argument("--model_path", type=str)
     parser.add_argument("--gcvf_path", type=str)
     parser.add_argument("--dataset_path", type=str)
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--total_timesteps", type=int, default=1e6)
     parser.add_argument("--num_envs", type=int, default=4)
     parser.add_argument("--value_threshold", type=float, default=0.85)
+    
     args = parser.parse_args()
     
-    main(args)
+    try:
+        main(args)
+    except Exception as e:
+        logging.exception("Error during execution")
+        raise

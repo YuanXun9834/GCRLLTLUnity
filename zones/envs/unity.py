@@ -157,32 +157,51 @@ class UnityGCRLLTLWrapper(gym.Env):
         """Process Unity observation steps into numpy array"""
         obs_list = []
         
+        # Detailed debug info
+        print("\nProcessing observations:")
+        print(f"Steps type: {type(steps)}")
+        print(f"Steps attributes: {dir(steps)}")
+        print(f"Number of agents: {len(steps)}")
+        
         # Check if we have any observations
         if len(steps.obs) == 0:
-            print("Warning: No observations received from Unity environment")
-            return np.zeros(38)  # Return zero array with correct dimension
+            print("Warning: Empty observation list from Unity")
+            print(f"Full steps object: {steps}")
+            return np.zeros(38)
             
-        for obs_idx, obs in enumerate(steps.obs):
+        for i, obs in enumerate(steps.obs):
+            print(f"\nObservation {i}:")
+            print(f"Shape: {obs.shape}")
+            print(f"Name: {self.spec.observation_specs[i].name}")
+            print(f"Values: {obs[0][:5]}")  # Print first 5 values
+            
             if len(obs.shape) == 1:  # Vector observations
+                if np.any(np.isnan(obs)):
+                    print(f"Warning: NaN values in observation {i}")
+                    continue
+                if np.any(np.isinf(obs)):
+                    print(f"Warning: Inf values in observation {i}")
+                    continue
+                print(f"Adding vector observation {i}")
                 obs_list.append(obs[0])
-            elif len(obs.shape) == 3:  # Visual observations (3, 64, 84)
-                # Flatten or process visual observation if needed
-                flat_visual = obs[0].reshape(-1)  # Flatten the first instance
+            elif len(obs.shape) == 3:  # Visual observations
+                if np.any(np.isnan(obs)):
+                    print(f"Warning: NaN values in visual observation {i}")
+                    continue
+                print(f"Adding visual observation {i}")
+                flat_visual = obs[0].reshape(-1)
                 obs_list.append(flat_visual)
-                
+
         if not obs_list:
-            print("Warning: No valid observations to process")
-            return np.zeros(38)  # Return zero array with correct dimension
-            
+            print("Warning: No valid observations after processing")
+            return np.zeros(38)
+
         try:
-            # Print shapes for debugging
-            print("Observation shapes before concatenation:", [arr.shape for arr in obs_list])
             concatenated = np.concatenate(obs_list)
-            print("Concatenated observation shape:", concatenated.shape)
+            print(f"Successfully concatenated observations, shape: {concatenated.shape}")
             return concatenated
         except Exception as e:
             print(f"Error concatenating observations: {e}")
-            print("Observation list:", obs_list)
             return np.zeros(38)
 
     def _get_obs(self, obs):

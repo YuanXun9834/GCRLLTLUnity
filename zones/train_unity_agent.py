@@ -24,61 +24,79 @@ def train_goal_conditioned_agent(unity_env_path, total_timesteps, num_envs, devi
     env_fns = [create_env_with_id(unity_env_path, i) for i in range(num_envs)]
     env = SubprocVecEnv(env_fns, start_method='spawn')
     
-    # Get the correct observation dimension from the environment
+    # Get the correct observation dimension
     obs_dim = env.observation_space['obs'].shape[0]
     print(f"Observation dimension: {obs_dim}")
     
-    # Setup logging
-    log_dir = "logs/training_progress"
-    os.makedirs(log_dir, exist_ok=True)
+    # Calculate appropriate buffer size
+    buffer_size = max(total_timesteps, 2048 * num_envs)
+    print(f"Buffer size: {buffer_size}")
     
-    model = PPO(
-        "MultiInputPolicy",
-        env,
-        verbose=1,
-        tensorboard_log=log_dir,
-        device=device
-    )
-    
-    # Initialize trajectory buffer with correct observation dimension
+    # Initialize trajectory buffer
     traj_buffer = TrajectoryBuffer(
         traj_length=1000,
-        buffer_size=total_timesteps,
-        obs_dim=obs_dim,  # Use the actual observation dimension
+        buffer_size=buffer_size,
+        obs_dim=obs_dim,
         n_envs=num_envs,
         device=device
     )
     
     try:
-        print("Training model...")
+        model = PPO(
+            "MultiInputPolicy",
+            env,
+            verbose=1,
+            tensorboard_log="logs",
+            device=device
+        )
+        
+        print("Starting training...")
         model.learn(
             total_timesteps=total_timesteps,
             callback=CollectTrajectoryCallback(traj_buffer),
             progress_bar=True
         )
         
-        print("Building trajectory dataset...")
+        # Save trajectory dataset
+        print("Building dataset from collected trajectories...")
         trajectory_dataset = traj_buffer.build_dataset(model.policy)
         
-        # Save model and dataset
-        os.makedirs("models", exist_ok=True)
-        os.makedirs("datasets", exist_ok=True)
+        base_dir = os.path.dirname(os.path.abspath(__file__))  # Get absolute path of script
         
-        model_path = os.path.join("models", "trained_model")
-        dataset_path = os.path.join("datasets", "trajectory_dataset.pt")
+        # Create directories
+        datasets_dir = os.path.join(base_dir, "datasets")
+        models_dir = os.path.join(base_dir, "models")
         
-        print(f"Saving model to {model_path}")
-        model.save(model_path)
+        os.makedirs(datasets_dir, exist_ok=True)
+        os.makedirs(models_dir, exist_ok=True)
         
-        print(f"Saving trajectory dataset to {dataset_path}")
-        torch.save(trajectory_dataset, dataset_path)
+        # Save with absolute paths
+        model_path = os.path.join(models_dir, "trained_model")
+        dataset_path = os.path.join(datasets_dir, "trajectory_dataset.pt")
         
-        print("Training completed successfully!")
-        print(f"Total episodes completed: {model.num_timesteps}")
-        print(f"Total trajectories collected: {len(trajectory_dataset)}")
+        print(f"\nDirectory Information:")
+        print(f"Base directory: {base_dir}")
+        print(f"Datasets directory: {datasets_dir}")
+        print(f"Dataset will be saved to: {dataset_path}")
+        
+        # When saving the dataset
+        if len(trajectory_dataset.states) > 0:
+            print(f"\nSaving dataset:")
+            print(f"Number of states: {len(trajectory_dataset.states)}")
+            print(f"Number of goal values: {len(trajectory_dataset.goal_values)}")
+            print(f"Saving to: {dataset_path}")
+            torch.save(trajectory_dataset, dataset_path)
+            
+            # Verify save
+            if os.path.exists(dataset_path):
+                print(f"Dataset saved successfully! File size: {os.path.getsize(dataset_path)} bytes")
+            else:
+                print("Warning: Dataset file not found after saving!")
+        else:
+            print("\nWarning: No trajectories collected! Dataset will not be saved.")
         
         return model, trajectory_dataset
-        
+            
     except Exception as e:
         print(f"Error during training: {e}")
         raise
