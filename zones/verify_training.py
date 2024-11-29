@@ -3,66 +3,207 @@ import numpy as np
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
 from envs.unity import UnityGCRLLTLWrapper
+import logging
+from collections import defaultdict
 
-def verify_training(model_path, env_path, num_episodes=10):
-    """Verify trained model performance"""
-    print("\nVerifying trained model...")
+# Set logging level to INFO only
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('verification.log'),
+        logging.StreamHandler()
+    ]
+)
+
+# Disable matplotlib debug logging
+logging.getLogger('matplotlib').setLevel(logging.WARNING)
+logging.getLogger('PIL').setLevel(logging.WARNING)
+
+
+def verify_training(model_path, env_path, num_episodes=20):
+    """Verify trained model performance with enhanced diagnostics"""
+    print("\nStarting training verification...")
     
     # Load model
     model = PPO.load(model_path)
     
-    # Create environment
+    # Create environment with debug flags
     env = UnityGCRLLTLWrapper(
         env_path=env_path,
-        worker_id=9999,  # High worker ID to avoid conflicts
-        no_graphics=False  # Set to True if you don't need visualization
+        worker_id=9999,
+        no_graphics=False
     )
     
-    # Test different goals
-    goals = ['green', 'red', 'yellow']
-    results = {goal: {'successes': 0, 'times': [], 'rewards': []} for goal in goals}
-    
-    for goal in goals:
-        print(f"\nTesting goal: {goal}")
+    # Track detailed statistics
+    episode_stats = {
+        'complete_sequences': 0,
+        'partial_sequences': defaultdict(int),
+        'goal_order_stats': defaultdict(int),
+        'all_sequences': [],
+        'rewards': [],
+        'steps_per_goal': defaultdict(list),
+        'action_distributions': defaultdict(int),  # Will store int actions
+        'goal_achievement_times': [],
+        'trajectories': []
+    }
+
+    for episode in range(num_episodes):
+        print(f"\n{'='*20} Episode {episode + 1} {'='*20}")
+        obs, _ = env.reset()
+        total_reward = 0
+        steps = 0
+        achieved_goals = set()
+        current_sequence = []
+        episode_trajectory = []
         
-        for episode in range(num_episodes):
-            env.fix_goal(goal)
-            obs, _ = env.reset()
-            done = False
-            total_reward = 0
-            steps = 0
+        done = False
+        while not done:
+            # Record pre-action state
+            pre_action_pos = obs['obs'][:2]
             
-            while not done:
-                action, _ = model.predict(obs, deterministic=True)
-                obs, reward, done, truncated, info = env.step(action)
-                total_reward += reward
-                steps += 1
-                
-                if info.get('goal_achieved', False):
-                    results[goal]['successes'] += 1
-                    results[goal]['times'].append(steps)
-                    results[goal]['rewards'].append(total_reward)
-                    print(f"Episode {episode + 1}: Goal achieved in {steps} steps!")
-                    break
-                
-                if steps >= 1000:  # Timeout
-                    print(f"Episode {episode + 1}: Timeout")
-                    break
-    
-    # Print results
-    print("\nResults Summary:")
-    for goal in goals:
-        success_rate = results[goal]['successes'] / num_episodes * 100
-        avg_time = np.mean(results[goal]['times']) if results[goal]['times'] else float('inf')
-        avg_reward = np.mean(results[goal]['rewards']) if results[goal]['rewards'] else 0
+            # Get model action
+            action, _ = model.predict(obs, deterministic=True)
+            # Convert numpy array to integer
+            action_int = action.item() if isinstance(action, np.ndarray) else int(action)
+            
+            print(f"\nStep {steps}:")
+            print(f"Current position: {pre_action_pos}")
+            print(f"Selected action: {action_int}")
+            
+            # Execute action
+            obs, reward, terminated, truncated, info = env.step(action_int)
+            done = terminated or truncated
+            
+            # Record post-action state
+            post_action_pos = obs['obs'][:2]
+            movement_delta = np.linalg.norm(post_action_pos - pre_action_pos)
+            
+            # Update statistics (using integer action)
+            total_reward += reward
+            steps += 1
+            episode_stats['action_distributions'][action_int] += 1
+            
+            # Store step information
+            episode_trajectory.append({
+                'step': steps,
+                'pre_pos': pre_action_pos.copy(),  # Make copies of numpy arrays
+                'post_pos': post_action_pos.copy(),
+                'action': action_int,  # Store as integer
+                'reward': float(reward),  # Convert to Python float
+                'movement': float(movement_delta),
+                'current_goal': info.get('current_goal'),
+                'achieved_goals': set(info.get('achieved_goals', set()))  # Make copy of set
+            })
+            
+            # Print step information
+            print(f"Movement: {movement_delta:.4f}")
+            print(f"Reward: {reward:.4f}")
+            print(f"Current goal: {info.get('current_goal')}")
+            print(f"Achieved goals: {info.get('achieved_goals', set())}")
+            
+            # Check goal achievements
+            current_achieved = set(info.get('achieved_goals', set()))
+            if current_achieved != achieved_goals:
+                new_goals = current_achieved - achieved_goals
+                for goal in new_goals:
+                    current_sequence.append(goal)
+                    episode_stats['steps_per_goal'][goal].append(steps)
+                achieved_goals = current_achieved
+            
+            if steps >= 1000:  # Timeout
+                print(f"Episode {episode + 1}: Timeout after {steps} steps")
+                break
         
-        print(f"\n{goal.upper()} Goal:")
-        print(f"Success Rate: {success_rate:.1f}%")
-        print(f"Average Steps to Goal: {avg_time:.1f}")
-        print(f"Average Reward: {avg_reward:.2f}")
+        # Record episode statistics
+        episode_stats['rewards'].append(total_reward)
+        episode_stats['all_sequences'].append(current_sequence)
+        episode_stats['trajectories'].append(episode_trajectory)
+        
+        if len(achieved_goals) == 3:  # Complete sequence
+            episode_stats['complete_sequences'] += 1
+            print(f"Completed sequence in {steps} steps: {' -> '.join(current_sequence)}")
+        else:
+            episode_stats['partial_sequences'][len(achieved_goals)] += 1
+            print(f"Partial completion: achieved {len(achieved_goals)} goals: {' -> '.join(current_sequence)}")
+        
+        # Record sequence order
+        sequence_str = '->'.join(current_sequence) if current_sequence else ''
+        episode_stats['goal_order_stats'][sequence_str] += 1
+    
+    # Print comprehensive summary
+    print("\nDetailed Results Summary:")
+    print(f"Complete Sequences: {episode_stats['complete_sequences']}/{num_episodes} "
+          f"({episode_stats['complete_sequences']/num_episodes*100:.1f}%)")
+    
+    print("\nPartial Completions:")
+    for num_goals, count in sorted(episode_stats['partial_sequences'].items()):
+        print(f"{num_goals} goals achieved: {count} times")
+    
+    print("\nSequence Orders Attempted:")
+    for sequence, count in episode_stats['goal_order_stats'].items():
+        print(f"{sequence}: {count} times")
+    
+    print("\nAction Distribution:")
+    total_actions = sum(episode_stats['action_distributions'].values())
+    for action, count in sorted(episode_stats['action_distributions'].items()):
+        action_name = {
+            0: 'NO_ACTION',
+            1: 'UP',
+            2: 'DOWN',
+            3: 'LEFT',
+            4: 'RIGHT'
+        }.get(action, f'UNKNOWN_{action}')
+        print(f"{action_name}: {count} times ({count/total_actions*100:.1f}%)")
+    
+    print("\nAverage Steps Per Goal:")
+    for goal, steps_list in episode_stats['steps_per_goal'].items():
+        if steps_list:
+            avg_steps = np.mean(steps_list)
+            print(f"{goal}: {avg_steps:.1f} steps")
+    
+    print(f"\nAverage reward per episode: {np.mean(episode_stats['rewards']):.2f}")
+    
+    # Plot trajectories
+    plot_trajectories(episode_stats['trajectories'])
     
     env.close()
-    return results
+    return episode_stats
+
+
+def plot_trajectories(trajectories):
+    """Plot movement patterns and reward distribution"""
+    plt.figure(figsize=(15, 5))
+    
+    # Plot movement patterns
+    plt.subplot(131)
+    for episode_traj in trajectories:
+        positions = np.array([step['post_pos'] for step in episode_traj])
+        plt.plot(positions[:, 0], positions[:, 1], alpha=0.5)
+    plt.title('Agent Trajectories')
+    plt.xlabel('X Position')
+    plt.ylabel('Y Position')
+    
+    # Plot reward distribution
+    plt.subplot(132)
+    rewards = [step['reward'] for traj in trajectories for step in traj]
+    plt.hist(rewards, bins=50)
+    plt.title('Reward Distribution')
+    plt.xlabel('Reward')
+    plt.ylabel('Count')
+    
+    # Plot movement heatmap
+    plt.subplot(133)
+    all_positions = np.array([step['post_pos'] for traj in trajectories for step in traj])
+    plt.hist2d(all_positions[:, 0], all_positions[:, 1], bins=20)
+    plt.title('Position Heatmap')
+    plt.xlabel('X Position')
+    plt.ylabel('Y Position')
+    
+    plt.tight_layout()
+    plt.savefig('training_analysis.png')
+    plt.close()
+
 
 def verify_dataset(dataset_path):
     """Verify trajectory dataset"""

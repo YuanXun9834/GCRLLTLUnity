@@ -1,117 +1,166 @@
 import argparse
-import logging
+import os
 import torch
-from train_unity_agent import train_goal_conditioned_agent
-from train_gcvf import main as train_value_function
-from algo.ltl import gltl2ba, get_ltl_formula
-from algo.scc import path_finding
-from algo.reaching import reaching
+from stable_baselines3 import PPO
 from envs.unity import UnityGCRLLTLWrapper
 
-def main(args):
-    # Step 1: Train goal-conditioned agent and collect trajectory data
-    if args.train_agent:
-        if args.unity_env_path is None:
-            raise ValueError("--unity_env_path is required for training the agent")
-        print("\n=== Starting Training ===")
-        model, trajectory_dataset = train_goal_conditioned_agent(
-            unity_env_path=args.unity_env_path,
-            total_timesteps=args.total_timesteps,
-            num_envs=args.num_envs,
-            device=args.device
+def execute_ltl_sequence(
+    unity_env_path: str,
+    goal_sequence: list,
+    models_dir: str = 'models',
+    device: str = 'cuda',
+    render: bool = True
+):
+    """Execute an LTL-generated goal sequence using sequence-specific models"""
+    
+    # Define all possible sequences for lookup
+    all_sequences = [
+        ['red', 'green', 'yellow'],
+        ['red', 'yellow', 'green'],
+        ['green', 'red', 'yellow'],
+        ['green', 'yellow', 'red'],
+        ['yellow', 'red', 'green'],
+        ['yellow', 'green', 'red']
+    ]
+    
+    # Find which sequence matches our optimal path
+    sequence_idx = None
+    for idx, seq in enumerate(all_sequences):
+        if seq == goal_sequence:
+            sequence_idx = idx
+            break
+            
+    if sequence_idx is None:
+        raise ValueError(f"Generated sequence {goal_sequence} doesn't match any trained sequence!")
+        
+    print(f"\nExecuting sequence {' -> '.join(goal_sequence)} using model {sequence_idx}")
+    
+    try:
+        # Load the appropriate model
+        model_path = os.path.join(models_dir, f'sequence_{sequence_idx}_final')
+        model = PPO.load(model_path, device=device)
+        print(f"Loaded model from {model_path}")
+        
+        # Create environment with this fixed sequence
+        env = UnityGCRLLTLWrapper(
+            env_path=unity_env_path,
+            worker_id=100,  # Different from training worker_ids
+            no_graphics=not render,  # Enable rendering if requested
+            time_scale=1.0 if render else 20.0  # Slower if rendering
         )
         
-        print("\n=== Training Complete ===")
-        print("Model saved to: models/trained_model")
-        print("Dataset saved to: datasets/trajectory_dataset.pt")
-    # Step 2: Train Goal-Conditioned Value Function
-    if args.train_gcvf:
-        if args.dataset_path is None:
-            raise ValueError("--dataset_path is required for training GCVF")
-        gcvf = train_value_function(
-            dataset_path=args.dataset_path,
-            device=args.device
-        )
+        # Set the sequence
+        env.set_fixed_goal_sequence(goal_sequence)
+        
+        # Execute the sequence
+        obs = env.reset()[0]
+        done = False
+        total_reward = 0
+        steps = 0
+        achieved_goals = set()
+        
+        print("\nStarting execution:")
+        while not done:
+            # Get action from the sequence-specific model
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, _, info = env.step(action)
+            total_reward += reward
+            steps += 1
+            
+            # Track newly achieved goals
+            current_goals = set(info.get('achieved_goals', []))
+            new_goals = current_goals - achieved_goals
+            if new_goals:
+                for goal in new_goals:
+                    print(f"Achieved goal: {goal} at step {steps}")
+            achieved_goals = current_goals
+            
+            # Print progress periodically
+            if steps % 100 == 0:
+                print(f"Step {steps}: {len(achieved_goals)}/{len(goal_sequence)} goals achieved")
+            
+            # Check for timeout or completion
+            if steps >= env.max_steps:
+                print("\nExecution timed out!")
+                break
+                
+        print("\nExecution completed!")
+        print(f"Goals achieved: {len(achieved_goals)}/{len(goal_sequence)}")
+        print(f"Total steps: {steps}")
+        print(f"Total reward: {total_reward:.2f}")
+        
+        return {
+            'success': len(achieved_goals) == len(goal_sequence),
+            'goals_achieved': achieved_goals,
+            'steps': steps,
+            'reward': total_reward
+        }
+        
+    except Exception as e:
+        print(f"Error during execution: {str(e)}")
+        raise
+    finally:
+        env.close()
 
-    # Step 3: Execute LTL task
-    if args.execute_ltl:
-        if any(arg is None for arg in [args.unity_env_path, args.model_path, args.gcvf_path, args.ltl_formula]):
-            raise ValueError("--unity_env_path, --model_path, --gcvf_path, and --ltl_formula are required for LTL execution")
-        # Convert LTL formula using ltl2ba
-        ltl_args = get_ltl_formula(formula=args.ltl_formula)
-        buchi_graph = gltl2ba(ltl_args)
-        
-        # Get value map for path finding
-        value_map = get_value_map(model, gcvf, observation, zone_vector, args.device)
-        
-        # Find path that satisfies the LTL formula
-        GOALS, AVOID_ZONES = path_finding(args.ltl_formula, value_map)
-        
-        # Execute the path in the environment
-        env = UnityGCRLLTLWrapper(args.unity_env_path)
-        task_info = reaching(env, model, GOALS, AVOID_ZONES, 
-                           value_threshold=args.value_threshold, 
-                           device=args.device)
-        
-        print(f"Task completion: {task_info['complete']}")
-        print(f"Dangerous states encountered: {task_info['dangerous']}")
-        if 'zone_history' in task_info:
-            print(f"Zone history: {task_info['zone_history']}")
-
-def get_value_map(model, gcvf, ob, zone_vector, device):
-    """Calculate value map for path finding"""
-    core_ob = ob[:-24]  # Remove zone vector from observation
-    zones = ['green', 'red', 'yellow']
-    value_map = {}
+def execute_ltl_task(
+    ltl_formula: str,
+    unity_env_path: str,
+    gcvf_model,
+    render: bool = True
+):
+    """Complete pipeline from LTL to execution"""
     
-    # Add single zone values
-    for zone in zones:
-        value_map[zone] = model.predict_value(
-            torch.cat([core_ob, zone_vector[zone]]).to(device)
-        )
+    # Convert LTL to Büchi automaton
+    automaton = ltl_to_buchi(ltl_formula)
     
-    # Add zone pair values
-    for zone1 in zones:
-        for zone2 in zones:
-            if zone1 != zone2:
-                map_ob = torch.cat([
-                    core_ob, 
-                    zone_vector[zone1],
-                    zone_vector[zone2]
-                ]).to(device)
-                value_map[f"{zone1}{zone2}"] = gcvf.predict(map_ob)
+    # Get value map from GCVF
+    value_map = get_value_map(gcvf_model)
     
-    return value_map
-
-if __name__ == "__main__":
-    # Setup logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('training.log'),
-            logging.StreamHandler()
-        ]
+    # Find optimal path
+    goals, avoid_zones = find_optimal_path(automaton, value_map)
+    
+    print(f"\nOptimal sequence found: {' -> '.join(goals)}")
+    if avoid_zones:
+        print(f"Zones to avoid: {avoid_zones}")
+    
+    # Execute the sequence
+    result = execute_ltl_sequence(
+        unity_env_path=unity_env_path,
+        goal_sequence=goals,
+        render=render
     )
+    
+    return result
+
+# Example usage
+if __name__ == "__main__":
+    import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--unity_env_path", type=str,
-                      help="Path to Unity environment executable")
-    parser.add_argument("--train_agent", action="store_true")
-    parser.add_argument("--train_gcvf", action="store_true")
-    parser.add_argument("--execute_ltl", action="store_true")
-    parser.add_argument("--ltl_formula", type=str)
-    parser.add_argument("--model_path", type=str)
-    parser.add_argument("--gcvf_path", type=str)
-    parser.add_argument("--dataset_path", type=str)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--total_timesteps", type=int, default=1e6)
-    parser.add_argument("--num_envs", type=int, default=4)
-    parser.add_argument("--value_threshold", type=float, default=0.85)
+    parser.add_argument('--ltl', type=str, required=True,
+                      help='LTL formula to execute')
+    parser.add_argument('--unity_env_path', type=str, required=True,
+                      help='Path to Unity environment')
+    parser.add_argument('--gcvf_path', type=str, required=True,
+                      help='Path to trained GCVF model')
+    parser.add_argument('--render', action='store_true',
+                      help='Enable Unity rendering')
     
     args = parser.parse_args()
     
-    try:
-        main(args)
-    except Exception as e:
-        logging.exception("Error during execution")
-        raise
+    # Load GCVF model
+    gcvf_model = torch.load(args.gcvf_path)
+    
+    # Execute task
+    result = execute_ltl_task(
+        ltl_formula=args.ltl,
+        unity_env_path=args.unity_env_path,
+        gcvf_model=gcvf_model,
+        render=args.render
+    )
+    
+    # Print results
+    print("\nTask execution complete!")
+    print(f"Success: {result['success']}")
+    print(f"Goals achieved: {len(result['goals_achieved'])}")
+    print(f"Total steps: {result['steps']}")
+    print(f"Total reward: {result['reward']:.2f}")

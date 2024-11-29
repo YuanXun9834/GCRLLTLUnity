@@ -15,39 +15,55 @@ from rl.callbacks import CollectTrajectoryCallback
 class CustomExtractor(BaseFeaturesExtractor):
     """Custom feature extractor for the Unity environment"""
     def __init__(self, observation_space):
+        # Calculate total observation dimension from Dict space
+        total_obs_dim = observation_space.spaces['obs'].shape[0]
         super().__init__(observation_space, features_dim=256)
         
-        # Get the total observation dimension (including goal vector)
-        base_obs_dim = observation_space.spaces['obs'].shape[0] - 24  # Subtract goal vector
+        # Split dimensions for state and goal vector
+        self.state_dim = total_obs_dim - 24  # Base observations
+        self.goal_dim = 24  # Goal vector dimension
         
-        self.obs_net = nn.Sequential(
-            nn.Linear(base_obs_dim, 128),  # 15 base dims
+        # State processing network
+        self.state_net = nn.Sequential(
+            nn.Linear(self.state_dim, 128),
             nn.ReLU(),
+            nn.LayerNorm(128),
             nn.Linear(128, 128),
             nn.ReLU(),
         )
 
+        # Goal processing network
         self.goal_net = nn.Sequential(
-            nn.Linear(24, 64),  # Process goal vector
+            nn.Linear(self.goal_dim, 64),
             nn.ReLU(),
+            nn.LayerNorm(64),
             nn.Linear(64, 128),
             nn.ReLU(),
         )
 
+        # Combined processing network
         self.combined_net = nn.Sequential(
-            nn.Linear(256, 256),  # 128 (obs_net) + 128 (goal_net)
+            nn.Linear(256, 256),  # 128 (state) + 128 (goal)
             nn.ReLU(),
+            nn.LayerNorm(256)
         )
-    def forward(self, observations):
-        obs = observations['obs']
-        state = obs[:, :-24]  # Base observation (15 dims)
-        goal = obs[:, -24:]   # Goal vector (24 dims)
 
-        state_features = self.obs_net(state)
+    def forward(self, observations):
+        # Extract observation dict
+        obs = observations['obs']
+        
+        # Split observation into state and goal components
+        state = obs[:, :self.state_dim]  # First part is state
+        goal = obs[:, -self.goal_dim:]   # Last 24 dimensions are goal vector
+        
+        # Process state and goal separately
+        state_features = self.state_net(state)
         goal_features = self.goal_net(goal)
         
-        return self.combined_net(torch.cat([state_features, goal_features], dim=1))
-
+        # Combine and process features
+        combined = torch.cat([state_features, goal_features], dim=1)
+        return self.combined_net(combined)
+    
 def create_env_with_id(unity_env_path, worker_id, goal_sequence=None):
     """Create Unity environment with specific worker ID"""
     def _init():
@@ -66,10 +82,11 @@ def create_env_with_id(unity_env_path, worker_id, goal_sequence=None):
 def train_goal_conditioned_agent(
     unity_env_path,
     total_timesteps,
-    num_envs=4,
+    num_envs=8,
     device='cuda',
     seed=0,
-    save_freq=10000
+    save_freq=10000,
+    log_interval=1000
 ):
     """Train a goal-conditioned agent and collect trajectories"""
     
@@ -112,12 +129,12 @@ def train_goal_conditioned_agent(
             "MultiInputPolicy",
             env,
             learning_rate=3e-4,
-            n_steps=2048,
-            batch_size=64,
+            n_steps=1024,
+            batch_size=128,
             n_epochs=10,
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=0.2,
+            ent_coef=0.01,  # Add entropy coefficient
             policy_kwargs=policy_kwargs,
             tensorboard_log="logs/unity_training",
             device=device,
@@ -140,7 +157,7 @@ def train_goal_conditioned_agent(
             deterministic=True
         )
 
-        traj_callback = CollectTrajectoryCallback(traj_buffer=traj_buffer)
+        traj_callback = CollectTrajectoryCallback(traj_buffer=traj_buffer,)
 
         # Train model
         print("Starting training...")

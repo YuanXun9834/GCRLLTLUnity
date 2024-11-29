@@ -1,56 +1,46 @@
-import gymnasium as gym
-from gymnasium import spaces
-import numpy as np
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.side_channel.engine_configuration_channel import EngineConfigurationChannel
 from mlagents_envs.base_env import ActionTuple
-import logging
-import os
-from datetime import datetime
-
-
-os.makedirs('logs/debug', exist_ok=True)
-
-# Setup logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(f'logs/debug/unity_env_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
-        logging.StreamHandler()
-    ]
+import gymnasium as gym
+import time
+from gymnasium import spaces
+import numpy as np
+from mlagents_envs.side_channel.side_channel import (
+    SideChannel,
+    IncomingMessage,
+    OutgoingMessage
 )
+import uuid
 
+class GoalSequenceChannel(SideChannel):
+    def __init__(self):
+        # Use same UUID as Unity side
+        channel_id = uuid.UUID('621f0a70-4f87-11ee-be56-0242ac120002')
+        super().__init__(channel_id)
+    
+    def on_message_received(self, msg: IncomingMessage) -> None:
+        """Required implementation of abstract method"""
+        pass
+    
+    def send_message(self, msg: OutgoingMessage) -> None:
+        """Send message to Unity"""
+        super().queue_message_to_send(msg)
 class UnityGCRLLTLWrapper(gym.Env):
-    def __init__(
-        self,
-        env_path: str,
-        worker_id: int = 0,
-        no_graphics: bool = True,
-        time_scale: float = 20.0,
-        seed: int = 0,
-        max_steps: int = 1000
-    ):
-        super().__init__()
-        self.logger = logging.getLogger(f"UnityEnv-{worker_id}")
-        self.logger.info(f"Initializing Unity environment with worker ID {worker_id}")
+    def __init__(self, env_path, worker_id=0, no_graphics=False, time_scale=1.0):
         self.env_path = env_path
-        self.worker_id = worker_id
-        self.unity_env = None
-        self.channel = EngineConfigurationChannel()
-        self.max_steps = max_steps
         
-        # Initialize Unity environment
-        print(f"Initializing Unity environment {worker_id}")
+        # Setup Unity environment
+        self.channel = EngineConfigurationChannel()
+        self.sequence_channel = GoalSequenceChannel()
         self.unity_env = UnityEnvironment(
             file_name=env_path,
             worker_id=worker_id,
             no_graphics=no_graphics,
-            seed=seed,
-            side_channels=[self.channel],
+            side_channels=[self.channel, self.sequence_channel],
             timeout_wait=60
         )
         
+        # Configure environment settings
         self.channel.set_configuration_parameters(
             time_scale=time_scale,
             width=640,
@@ -58,192 +48,127 @@ class UnityGCRLLTLWrapper(gym.Env):
             quality_level=0
         )
         
-        # Initialize environment
+        # Initialize connection
         self.unity_env.reset()
         self.behavior_name = list(self.unity_env.behavior_specs.keys())[0]
-        self.spec = self.unity_env.behavior_specs[self.behavior_name]
         
-        # Initialize spaces
+        # Current goal tracking
+        self._current_goal = None
+        self._goal_sequence = None
+        
+        # Setup spaces
         self._setup_spaces()
         
-        # State tracking
-        self.current_goal = None
-        self.steps = 0
-        self.has_powerup = False
-        self.achieved_goals = set()
-        
-        # Goal representations
-        self.goals_representation = {
-            'green': np.tile([1, 0, 0], 8),
-            'red': np.tile([0, 1, 0], 8),
-            'yellow': np.tile([0, 0, 1], 8)
-        }
-        
-        # Normalize goal vectors
-        for goal in self.goals_representation:
-            self.goals_representation[goal] = self.goals_representation[goal] / np.linalg.norm(self.goals_representation[goal])
-
     def _setup_spaces(self):
-        """Setup observation and action spaces"""
-        # Base observation size: agent position (2) + goal one-hot (3) + powerup (1) + achieved goals (3) + goal positions (6)
-        base_obs_size = 15  # 2 + 3 + 1 + 3 + 6
-        goal_dim = 24
-        
+        """Setup basic observation and action spaces"""
         self.observation_space = spaces.Dict({
-            'obs': spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-                shape=(base_obs_size + goal_dim,),
-                dtype=np.float32
-            ),
-            'success': spaces.Box(low=0, high=1, shape=(1,)),
-            'steps': spaces.Box(low=0, high=np.inf, shape=(1,))
+            'obs': spaces.Box(low=-np.inf, high=np.inf, shape=(39,), dtype=np.float32)
         })
-        
-        self.action_space = spaces.Discrete(5)
+        self.action_space = spaces.Discrete(4)  # UP, DOWN, LEFT, RIGHT
 
     def _process_obs(self, steps):
-        """Process Unity observation into numpy array"""
         if len(steps) == 0:
             return np.zeros(15)
-            
-        # Get only the vector observation (index 1)
+                
+        # Get vector observation
         vector_obs = steps.obs[1][0]  # Shape: (15,)
         
-        # Extract the components we need from the vector observation
-        agent_pos = vector_obs[0:2]  # First two values are position
-        goal_onehot = np.zeros(3)
-        if self.current_goal == 'green':
-            goal_onehot[0] = 1
-        elif self.current_goal == 'red':
-            goal_onehot[1] = 1
-        elif self.current_goal == 'yellow':
-            goal_onehot[2] = 1
-            
-        # Powerup status (1)
-        powerup = np.array([float(self.has_powerup)])
+        # Unity uses (x,z), but we need to map it to our (x,y) system
+        unity_x, unity_z = vector_obs[:2]
+        agent_pos = np.array([unity_x, unity_z])  # Keep x, but use z as our y
         
-        # Achieved goals (3)
-        achieved = np.zeros(3)
-        if 'green' in self.achieved_goals:
-            achieved[0] = 1
-        if 'red' in self.achieved_goals:
-            achieved[1] = 1
-        if 'yellow' in self.achieved_goals:
-            achieved[2] = 1
-                
-        # Goal positions from observation (6 values: 3 goals x 2 coordinates)
-        goal_positions = vector_obs[2:8]
-        
-        # Concatenate all components
-        final_obs = np.concatenate([
-            agent_pos.flatten(),      # 2
-            goal_onehot.flatten(),    # 3
-            powerup.flatten(),        # 1
-            achieved.flatten(),       # 3
-            goal_positions.flatten()  # 6
-        ])                           # Total: 15
-        
-        return final_obs.astype(np.float32)
-
-    def _get_obs(self, obs):
-        """Convert processed observation to GCRL format"""
-        goal_vec = self.goals_representation[self.current_goal] if self.current_goal else np.zeros(24)
-        
-        return {
-            'obs': np.concatenate([obs, goal_vec]).astype(np.float32),
-            'success': np.array([float(self._check_goal_achievement(obs))], dtype=np.float32),
-            'steps': np.array([self.steps], dtype=np.float32)
-        }
-
-    def _check_goal_achievement(self, obs):
-        """Check if current goal is achieved based on proximity"""
-        if self.current_goal is None:
-            return False
-            
-        agent_pos = obs[:2]
+        # Similarly map goal positions
         goal_positions = {
-            'red': obs[8:10],
-            'yellow': obs[10:12],
-            'green': obs[12:14]
+            'red': vector_obs[8:10],    # Maps Unity's (x,z) for red
+            'green': vector_obs[10:12],  # Maps Unity's (x,z) for green
+            'yellow': vector_obs[12:14]  # Maps Unity's (x,z) for yellow
         }
         
-        goal_pos = goal_positions[self.current_goal]
-        distance = np.linalg.norm(agent_pos - goal_pos)
-        
-        return distance < 0.4
-
+        return vector_obs
+    
     def step(self, action):
-        """Execute action in environment"""
-        unity_action = ActionTuple(discrete=np.array([[action]]))
-        
+        """Take step in environment with proper coordinate mapping"""
+        # Map our actions to Unity's coordinate system
+        unity_action = self._map_action_to_unity(action)
+        unity_action = ActionTuple(discrete=np.array([[int(unity_action)]])) 
+
+        # Execute action
         self.unity_env.set_actions(self.behavior_name, unity_action)
         self.unity_env.step()
         
+        # Get results
         decision_steps, terminal_steps = self.unity_env.get_steps(self.behavior_name)
+        done = len(terminal_steps) > 0
         
-        terminated = len(terminal_steps) > 0
-        truncated = self.steps >= self.max_steps
-        
-        if terminated:
+        # Get observation and verify actual movement
+        if done:
             obs = self._process_obs(terminal_steps)
             reward = terminal_steps.reward[0]
         else:
             obs = self._process_obs(decision_steps)
             reward = decision_steps.reward[0]
         
-        self.steps += 1
-        
-        # Check goal achievement and update state
-        goal_achieved = self._check_goal_achievement(obs)
-        if goal_achieved:
-            if self.current_goal == 'green':
-                self.has_powerup = True
-                reward += 2.0
-            reward += 1.0
-            self.achieved_goals.add(self.current_goal)
-        
-        reward -= 0.01  # Small step penalty
-        
-        if goal_achieved and self.has_powerup and self.current_goal != 'green':
-            reward += 2.0
-        
-        info = {
-            'goal_achieved': goal_achieved,
-            'has_powerup': self.has_powerup,
-            'achieved_goals': self.achieved_goals
-        }
-        
-        return self._get_obs(obs), reward, terminated or truncated, truncated, info
+        return {'obs': obs}, reward, done, False, {}
 
-    def reset(self, seed=None, options=None):
+    def _map_action_to_unity(self, action):
+        """Map our action space to Unity's proper coordinate system"""
+        # Unity coordinates vs our coordinates:
+        # Unity (x,z):     Our system:
+        # +z is forward     +y is up
+        # -z is backward    -y is down
+        # +x is right       +x is right 
+        # -x is left        -x is left
+
+        unity_action_map = {
+            0: 3,  # UP should map to Unity's FORWARD (+z)
+            1: 2,  # DOWN should map to Unity's BACKWARD (-z)
+            2: 0,  # LEFT should map to Unity's LEFT (-x)
+            3: 1   # RIGHT should map to Unity's RIGHT (+x)
+        }
+        return unity_action_map.get(action, action)
+        
+    def reset(self):
         """Reset environment"""
-        if seed is not None:
-            self.unity_env.seed = seed
-            
         self.unity_env.reset()
         decision_steps, _ = self.unity_env.get_steps(self.behavior_name)
         
-        self.steps = 0
-        self.has_powerup = False
-        self.achieved_goals.clear()
+        obs = {'obs': self._process_obs(decision_steps)}
+        return obs, {}
+
+    def set_fixed_goal_sequence(self, sequence):
+        """Set goal sequence through side channel to Unity"""
+        # Convert sequence to Unity's goal indices
+        goal_to_unity = {
+            'red': 0,    # RedEx
+            'green': 1,  # GreenPlus  
+            'yellow': 2  # YellowStar
+        }
         
-        obs = self._process_obs(decision_steps)
-        
-        # Set initial goal if none is set
-        if self.current_goal is None:
-            self.current_goal = 'green'  # Default to green as first goal
+        try:
+            # Create message
+            msg = OutgoingMessage()
+            msg.write_int32(len(sequence))  # Write sequence length
             
-        return self._get_obs(obs), {}
+            # Convert and write each goal
+            unity_sequence = [goal_to_unity[goal] for goal in sequence]
+            for goal_idx in unity_sequence:
+                msg.write_int32(goal_idx)
+                
+            # Send through channel
+            self.sequence_channel.send_message(msg)
+            print(f"Sent sequence to Unity: {sequence}")
+            
+            # Store locally
+            self._goal_sequence = sequence
+            self._current_goal = sequence[0]
+            return True
+            
+        except Exception as e:
+            print(f"Failed to send sequence: {e}")
+            return False
 
     def close(self):
-        """Clean up environment"""
-        if self.unity_env is not None:
+        """Cleanup"""
+        if self.unity_env:
             self.unity_env.close()
             self.unity_env = None
-
-    def fix_goal(self, goal: str):
-        """Set current goal"""
-        if goal not in self.goals_representation:
-            raise ValueError(f"Unknown goal: {goal}. Available goals: {list(self.goals_representation.keys())}")
-        self.current_goal = goal
